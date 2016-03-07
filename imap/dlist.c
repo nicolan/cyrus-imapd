@@ -135,55 +135,35 @@ static void printfile(struct protstream *out, const struct dlist *dl)
     map_free(&msg_base, &msg_len);
 }
 
-static void printsfile(struct protstream *out, const struct dlist *dl) {
-    size_t size;
-    struct message_guid guid2;
-
-    assert(dlist_issfile(dl));
-
-    size = strlen(dl->sval);
-    if (size != dl->nval) {
-        syslog(LOG_ERR, "IOERROR: Size mismatch %s (" SIZE_T_FMT " != " MODSEQ_FMT ")",
-               message_guid_encode(dl->gval), size, dl->nval);
-        prot_printf(out, "NIL");
-        return;
-    }
-
-    message_guid_generate(&guid2, dl->sval, size);
-
-    if (!message_guid_equal(&guid2, dl->gval)) {
-        syslog(LOG_ERR, "IOERROR: GUID mismatch %s %s",
-               message_guid_encode(dl->gval),
-               message_guid_encode(&guid2));
-        prot_printf(out, "NIL");
-        return;
-    }
-
-    prot_printf(out, "%%{");
-    prot_printastring(out, dl->part);
-    prot_printf(out, " ");
-    prot_printastring(out, message_guid_encode(dl->gval));
-    prot_printf(out, " " SIZE_T_FMT "}\r\n", size);
-    prot_write(out, dl->sval, dl->nval);
-}
-
-
 /* XXX - these two functions should be out in append.c or reserve.c
  * or something more general */
 EXPORTED const char *dlist_reserve_path(const char *part, int isarchive,
                                         const struct message_guid *guid)
 {
     static char buf[MAX_MAILBOX_PATH];
-    const char *base = isarchive ? config_archivepartitiondir(part)
-                                 : config_partitiondir(part);
+    const char *base;
+
+    /* part can be either a configured partition name, or a path */
+    if (strchr(part, '/')) {
+        base = part;
+    }
+    else {
+        base = isarchive ? config_archivepartitiondir(part)
+                         : config_partitiondir(part);
+    }
+
+    /* we expect to have a base at this point, so let's assert that */
+    assert(base != NULL);
+
     snprintf(buf, MAX_MAILBOX_PATH, "%s/sync./%lu/%s",
                   base, (unsigned long)getpid(),
                   message_guid_encode(guid));
+
     /* gotta make sure we can create files */
     if (cyrus_mkdir(buf, 0755)) {
         /* it's going to fail later, but at least this will help */
-        syslog(LOG_ERR, "IOERROR: failed to create %s/%lu/ for reserve: %m",
-               config_partitiondir(part), (unsigned long)getpid());
+        syslog(LOG_ERR, "IOERROR: failed to create %s/sync./%lu/ for reserve: %m",
+                        base, (unsigned long)getpid());
     }
     return buf;
 }
@@ -194,7 +174,7 @@ static int reservefile(struct protstream *in, const char *part,
 {
     FILE *file;
     char buf[8192+1];
-    int r = 0, n;
+    int r = 0;
 
     /* XXX - write to a temporary file then move in to place! */
     *fname = dlist_reserve_path(part, /*isarchive*/0, guid);
@@ -204,7 +184,8 @@ static int reservefile(struct protstream *in, const char *part,
 
     file = fopen(*fname, "w+");
     if (!file) {
-        syslog(LOG_ERR, "IOERROR: failed to upload file %s", message_guid_encode(guid));
+        syslog(LOG_ERR,
+               "IOERROR: failed to upload file %s", message_guid_encode(guid));
         r = IMAP_IOERROR;
         /* Note: we still read the file's data from the wire,
          * to avoid losing protocol sync */
@@ -212,7 +193,7 @@ static int reservefile(struct protstream *in, const char *part,
 
     /* XXX - calculate sha1 on the fly? */
     while (size) {
-        n = prot_read(in, buf, size > 8192 ? 8192 : size);
+        size_t n = prot_read(in, buf, size > 8192 ? 8192 : size);
         if (!n) {
             syslog(LOG_ERR,
                 "IOERROR: reading message: unexpected end of file");
@@ -220,7 +201,11 @@ static int reservefile(struct protstream *in, const char *part,
             break;
         }
         size -= n;
-        if (!r) fwrite(buf, 1, n, file);
+        if (fwrite(buf, 1, n, file) != n) {
+            syslog(LOG_ERR, "IOERROR: writing to file '%s': %m", *fname);
+            r = IMAP_IOERROR;
+            break;
+        }
     }
 
     if (r)
@@ -234,6 +219,7 @@ static int reservefile(struct protstream *in, const char *part,
     }
 
     if (fsync(fileno(file)) < 0) {
+        syslog(LOG_ERR, "IOERROR: fsyncing file '%s': %m", *fname);
         r = IMAP_IOERROR;
         goto error;
     }
@@ -266,7 +252,7 @@ EXPORTED void dlist_stitch(struct dlist *parent, struct dlist *child)
     }
 }
 
-void dlist_unstitch(struct dlist *parent, struct dlist *child)
+EXPORTED void dlist_unstitch(struct dlist *parent, struct dlist *child)
 {
     struct dlist *prev = NULL;
     struct dlist *replace = NULL;
@@ -421,24 +407,6 @@ void dlist_makefile(struct dlist *dl,
         dl->type = DL_NIL;
 }
 
-EXPORTED void dlist_makesfile(struct dlist *dl,
-                              const char *part, const struct message_guid *guid,
-                              const char *contents, unsigned long size)
-{
-    if (!dl) return;
-    _dlist_clean(dl);
-    if (part && guid && contents) {
-        dl->type = DL_SFILE;
-        dl->gval = xzmalloc(sizeof(struct message_guid));
-        message_guid_copy(dl->gval, guid);
-        dl->sval = xstrndup(contents, size);
-        dl->nval = size;
-        dl->part = xstrdup(part);
-    }
-    else
-        dl->type = DL_NIL;
-}
-
 EXPORTED void dlist_makemap(struct dlist *dl, const char *val, size_t len)
 {
     if (!dl) return;
@@ -544,15 +512,6 @@ EXPORTED struct dlist *dlist_setfile(struct dlist *parent, const char *name,
 {
     struct dlist *dl = dlist_child(parent, name);
     dlist_makefile(dl, part, guid, size, fname);
-    return dl;
-}
-
-EXPORTED struct dlist *dlist_setsfile(struct dlist *parent, const char *name,
-                                      const char *part, const struct message_guid *guid,
-                                      const char *contents, size_t size)
-{
-    struct dlist *dl = dlist_child(parent, name);
-    dlist_makesfile(dl, part, guid, contents, size);
     return dl;
 }
 
@@ -692,9 +651,6 @@ EXPORTED void dlist_print(const struct dlist *dl, int printkeys,
         }
         prot_printf(out, ")");
         break;
-    case DL_SFILE:
-        printsfile(out, dl);
-        break;
     }
 }
 
@@ -708,6 +664,24 @@ EXPORTED void dlist_printbuf(const struct dlist *dl, int printkeys, struct buf *
     prot_free(outstream);
 }
 
+EXPORTED void dlist_unlink_files(struct dlist *dl)
+{
+    struct dlist *i;
+
+    if (!dl) return;
+
+    for (i = dl->head; i; i = i->next) {
+        dlist_unlink_files(i);
+    }
+
+    if (dl->type != DL_FILE) return;
+
+    if (!dl->sval) return;
+
+    syslog(LOG_DEBUG, "%s: unlinking %s", __func__, dl->sval);
+    unlink(dl->sval);
+}
+
 EXPORTED void dlist_free(struct dlist **dlp)
 {
     if (!*dlp) return;
@@ -715,6 +689,132 @@ EXPORTED void dlist_free(struct dlist **dlp)
     free((*dlp)->name);
     free(*dlp);
     *dlp = NULL;
+}
+
+struct dlist_stack_node {
+    const struct dlist *dl;
+    int printkeys;
+    struct dlist_stack_node *next;
+};
+
+struct dlist_print_iter {
+    int printkeys;
+    struct dlist_stack_node *parent;
+    const struct dlist *next;
+};
+
+EXPORTED struct dlist_print_iter *dlist_print_iter_new(const struct dlist *dl, int printkeys)
+{
+    struct dlist_print_iter *iter = xzmalloc(sizeof *iter);
+    iter->printkeys = printkeys;
+    iter->next = dl;
+
+    return iter;
+}
+
+EXPORTED const char *dlist_print_iter_step(struct dlist_print_iter *iter, struct buf *outbuf)
+{
+    /* already finished */
+    if (!iter->next) return NULL;
+
+    buf_reset(outbuf);
+
+    /* Bundle short steps together to minimise call overhead.
+     * Note that outbuf can grow significantly longer than this limit, if a
+     * single item in the dlist is very long (e.g. a message), but then it
+     * won't bundle up more than that.
+     */
+    while (iter->next != NULL && buf_len(outbuf) < 1024) {
+        const struct dlist *curr = iter->next;
+        struct dlist_stack_node *parent = NULL;
+        int descend = 0;
+
+        /* output */
+        switch (curr->type) {
+        case DL_KVLIST:
+        case DL_ATOMLIST:
+            // XXX should use equiv to "prot_printastring" for curr->name
+            if (iter->printkeys)
+                buf_printf(outbuf, "%s ", curr->name);
+
+            buf_appendcstr(outbuf, curr->type == DL_KVLIST ? "%(" : "(");
+
+            if (curr->head) {
+                descend = 1;
+            }
+            else {
+                buf_putc(outbuf, ')');
+                if (curr->next)
+                    buf_putc(outbuf, ' ');
+            }
+            break;
+
+        default:
+            dlist_printbuf(curr, iter->printkeys, outbuf);
+            if (curr->next)
+                buf_putc(outbuf, ' ');
+            break;
+        }
+
+        /* increment */
+        if (descend) {
+            parent = xmalloc(sizeof *parent);
+            parent->printkeys = iter->printkeys;
+            parent->dl = curr;
+            parent->next = iter->parent;
+            iter->parent = parent;
+            iter->next = curr->head;
+            // XXX can this always be 1? we know an atom list here is non-empty
+            iter->printkeys = curr->type == DL_KVLIST ? 1 : curr->nval;
+        }
+        else if (curr->next) {
+            iter->next = curr->next;
+        }
+        else if (iter->parent) {
+            /* multiple parents might be ending at the same point
+             * don't mistake one parent ending for end of entire tree
+             */
+            do {
+                buf_putc(outbuf, ')');
+
+                parent = iter->parent;
+
+                iter->parent = iter->parent->next;
+                iter->next = parent->dl->next;
+                iter->printkeys = parent->printkeys;
+
+                free(parent);
+
+                if (iter->next) {
+                    /* found an unfinished dlist, stop closing parents */
+                    buf_putc(outbuf, ' ');
+                    break;
+                }
+            } while (iter->parent);
+        }
+        else {
+            iter->next = NULL;
+        }
+    }
+
+    /* and return */
+    return buf_cstringnull(outbuf);
+}
+
+EXPORTED void dlist_print_iter_free(struct dlist_print_iter **iterp)
+{
+    struct dlist_print_iter *iter = *iterp;
+    struct dlist_stack_node *tmp = NULL;
+
+    *iterp = NULL;
+
+    while (iter->parent) {
+        tmp = iter->parent;
+        iter->parent = iter->parent->next;
+        free(tmp);
+    }
+
+    free(iter);
 }
 
 struct dlistsax_state {
@@ -908,7 +1008,8 @@ static char next_nonspace(struct protstream *in, char c)
     return c;
 }
 
-EXPORTED char dlist_parse(struct dlist **dlp, unsigned int flags, struct protstream *in)
+EXPORTED int dlist_parse(struct dlist **dlp, int parsekey,
+                          struct protstream *in, const char *alt_reserve_base)
 {
     struct dlist *dl = NULL;
     static struct buf kbuf;
@@ -916,7 +1017,7 @@ EXPORTED char dlist_parse(struct dlist **dlp, unsigned int flags, struct protstr
     int c;
 
     /* handle the key if wanted */
-    if ((flags & DLIST_PARSEKEY)) {
+    if (parsekey) {
         c = getastring(in, NULL, &kbuf);
         c = next_nonspace(in, c);
     }
@@ -935,7 +1036,7 @@ EXPORTED char dlist_parse(struct dlist **dlp, unsigned int flags, struct protstr
         while (c != ')') {
             struct dlist *di = NULL;
             prot_ungetc(c, in);
-            c = dlist_parse(&di, (flags & ~DLIST_PARSEKEY), in);
+            c = dlist_parse(&di, 0, in, alt_reserve_base);
             if (di) dlist_stitch(dl, di);
             c = next_nonspace(in, c);
             if (c == EOF) goto fail;
@@ -951,7 +1052,7 @@ EXPORTED char dlist_parse(struct dlist **dlp, unsigned int flags, struct protstr
             while (c != ')') {
                 struct dlist *di = NULL;
                 prot_ungetc(c, in);
-                c = dlist_parse(&di, (flags | DLIST_PARSEKEY), in);
+                c = dlist_parse(&di, 1, in, alt_reserve_base);
                 if (di) dlist_stitch(dl, di);
                 c = next_nonspace(in, c);
                 if (c == EOF) goto fail;
@@ -959,9 +1060,10 @@ EXPORTED char dlist_parse(struct dlist **dlp, unsigned int flags, struct protstr
         }
         else if (c == '{') {
             struct message_guid tmp_guid;
-            static struct buf pbuf, gbuf, sbuf;
+            static struct buf pbuf, gbuf;
             unsigned size = 0;
             const char *fname;
+            const char *part;
             c = getastring(in, NULL, &pbuf);
             if (c != ' ') goto fail;
             c = getastring(in, NULL, &gbuf);
@@ -972,19 +1074,9 @@ EXPORTED char dlist_parse(struct dlist **dlp, unsigned int flags, struct protstr
             if (c == '\r') c = prot_getc(in);
             if (c != '\n') goto fail;
             if (!message_guid_decode(&tmp_guid, gbuf.s)) goto fail;
-            if ((flags & DLIST_SFILE)) {
-                buf_reset(&sbuf);
-                while (size) {
-                    int n = prot_readbuf(in, &sbuf, size > 8192 ? 8192 : size);
-                    if (n <= 0) goto fail;
-                    size -= n;
-                }
-                dl = dlist_setsfile(NULL, kbuf.s, pbuf.s, &tmp_guid, sbuf.s, sbuf.len);
-            }
-            else {
-                if (reservefile(in, pbuf.s, &tmp_guid, size, &fname)) goto fail;
-                dl = dlist_setfile(NULL, kbuf.s, pbuf.s, &tmp_guid, size, fname);
-            }
+            part = alt_reserve_base ? alt_reserve_base : pbuf.s;
+            if (reservefile(in, part, &tmp_guid, size, &fname)) goto fail;
+            dl = dlist_setfile(NULL, kbuf.s, pbuf.s, &tmp_guid, size, fname);
             /* file literal */
         }
         else {
@@ -1019,10 +1111,10 @@ fail:
     return EOF;
 }
 
-EXPORTED char dlist_parse_asatomlist(struct dlist **dlp, unsigned int flags,
+EXPORTED int dlist_parse_asatomlist(struct dlist **dlp, int parsekey,
                             struct protstream *in)
 {
-    char c = dlist_parse(dlp, flags, in);
+    int c = dlist_parse(dlp, parsekey, in, NULL);
 
     /* make a list with one item */
     if (*dlp && !dlist_isatomlist(*dlp)) {
@@ -1034,16 +1126,16 @@ EXPORTED char dlist_parse_asatomlist(struct dlist **dlp, unsigned int flags,
     return c;
 }
 
-EXPORTED int dlist_parsemap(struct dlist **dlp, unsigned int flags,
+EXPORTED int dlist_parsemap(struct dlist **dlp, int parsekey,
                    const char *base, unsigned len)
 {
     struct protstream *stream;
-    char c;
+    int c;
     struct dlist *dl = NULL;
 
     stream = prot_readmap(base, len);
     prot_setisclient(stream, 1); /* don't sync literals */
-    c = dlist_parse(&dl, flags, stream);
+    c = dlist_parse(&dl, parsekey, stream, NULL);
     prot_free(stream);
 
     if (c != EOF) {
@@ -1379,12 +1471,6 @@ int dlist_isfile(const struct dlist *dl)
     if (!dl) return 0;
 
     return (dl->type == DL_FILE);
-}
-
-int dlist_issfile(const struct dlist *dl)
-{
-    if (!dl) return 0;
-    return (dl->type == DL_SFILE);
 }
 
 /* XXX - these ones aren't const, because they can change

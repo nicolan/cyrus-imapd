@@ -904,7 +904,7 @@ static imt_stat getauthline(struct sasl_cmd_t *sasl_cmd, char **line, int *linel
         /* decode this line */
         saslresult = sasl_decode64(str, strlen(str),
                                    *line, len, (unsigned *) linelen);
-        if (saslresult != SASL_OK) {
+        if (saslresult != SASL_OK && saslresult != SASL_CONTINUE) {
             printf("base64 decoding error\n");
             return STAT_NO;
         }
@@ -1736,8 +1736,8 @@ static int imap_pipe_oneline(char *buf, int len, void *rock) {
     }
 
     if(!text->inLiteral) {
-        char c, *tag, *cmd, *tmp, *sparebuf = (char *)xstrdup(buf);
-        int i;
+        char *tag, *cmd, *tmp, *sparebuf = (char *)xstrdup(buf);
+        int c, i;
         tmp = sparebuf;
 
         if(len > 4 &&

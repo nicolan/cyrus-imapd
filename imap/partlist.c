@@ -154,7 +154,7 @@ EXPORTED void partlist_initialize(partlist_t *part_list, cb_part_filldata fillda
 }
 
 
-static void partlist_free(partlist_t *part_list)
+EXPORTED void partlist_free(partlist_t *part_list)
 {
     int i;
 
@@ -215,6 +215,20 @@ EXPORTED const char *partlist_select_value(partlist_t *part_list)
     return (idx == -1 ? NULL : part_list->items[idx].value);
 }
 
+EXPORTED int partlist_foreach(partlist_t *part_list,
+                              partlist_foreach_cb proc,
+                              void *rock)
+{
+    int i, r = -1;
+
+    for (i = 0; i < part_list->size; i++) {
+        r = proc(&part_list->items[i], rock);
+
+        if (r) break;
+    }
+
+    return r;
+}
 
 static int partlist_selectpart_index(partlist_t *part_list)
 {

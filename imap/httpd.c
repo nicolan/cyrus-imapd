@@ -138,9 +138,8 @@ struct auth_state *httpd_authstate = 0;
 int httpd_userisadmin = 0;
 int httpd_userisproxyadmin = 0;
 int httpd_userisanonymous = 1;
-struct sockaddr_storage httpd_localaddr, httpd_remoteaddr;
-int httpd_haveaddr = 0;
-char httpd_clienthost[NI_MAXHOST*2+1] = "[local]";
+static const char *httpd_clienthost = "[local]";
+const char *httpd_localip = NULL, *httpd_remoteip = NULL;
 struct protstream *httpd_out = NULL;
 struct protstream *httpd_in = NULL;
 struct protgroup *protin = NULL;
@@ -263,7 +262,7 @@ struct namespace_t namespace_default = {
     URL_NS_DEFAULT, 1, "", NULL, 0 /* no auth */,
     /*mbtype*/0,
     ALLOW_READ,
-    NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL,
     {
         { NULL,                 NULL },                 /* ACL          */
         { NULL,                 NULL },                 /* BIND         */
@@ -290,23 +289,22 @@ struct namespace_t namespace_default = {
 
 /* Array of different namespaces and features supported by the server */
 struct namespace_t *namespaces[] = {
-#ifdef WITH_DAV
 #ifdef WITH_JSON
+    &namespace_jmap,
     &namespace_tzdist,          /* MUST be before namespace_calendar!! */
 #endif /* WITH_JSON */
-    &namespace_principal,
+#ifdef WITH_DAV
     &namespace_calendar,
     &namespace_freebusy,
     &namespace_addressbook,
     &namespace_drive,
+    &namespace_principal,       /* MUST be after namespace_cal & addr & drive */
+    &namespace_notify,          /* MUST be after namespace_principal */
 #ifdef HAVE_IANA_PARAMS
     &namespace_ischedule,
     &namespace_domainkey,
 #endif /* HAVE_IANA_PARAMS */
 #endif /* WITH_DAV */
-#ifdef WITH_JSON
-    &namespace_jmap,
-#endif /* WITH_JSON */
     &namespace_rss,
     &namespace_dblookup,
     &namespace_admin,
@@ -373,7 +371,7 @@ static void httpd_reset(void)
 
     cyrus_reset_stdio();
 
-    strcpy(httpd_clienthost, "[local]");
+    httpd_clienthost = "[local]";
     if (httpd_logfd != -1) {
         close(httpd_logfd);
         httpd_logfd = -1;
@@ -544,10 +542,6 @@ int service_main(int argc __attribute__((unused)),
                  char **argv __attribute__((unused)),
                  char **envp __attribute__((unused)))
 {
-    socklen_t salen;
-    char hbuf[NI_MAXHOST];
-    char localip[60], remoteip[60];
-    int niflags;
     sasl_security_properties_t *secprops=NULL;
     const char *mechlist, *mech;
     int mechcount = 0;
@@ -565,36 +559,7 @@ int service_main(int argc __attribute__((unused)),
     protgroup_insert(protin, httpd_in);
 
     /* Find out name of client host */
-    salen = sizeof(httpd_remoteaddr);
-    if (getpeername(0, (struct sockaddr *)&httpd_remoteaddr, &salen) == 0 &&
-        (httpd_remoteaddr.ss_family == AF_INET ||
-         httpd_remoteaddr.ss_family == AF_INET6)) {
-        if (getnameinfo((struct sockaddr *)&httpd_remoteaddr, salen,
-                        hbuf, sizeof(hbuf), NULL, 0, NI_NAMEREQD) == 0) {
-            strncpy(httpd_clienthost, hbuf, sizeof(hbuf));
-            strlcat(httpd_clienthost, " ", sizeof(httpd_clienthost));
-        } else {
-            httpd_clienthost[0] = '\0';
-        }
-        niflags = NI_NUMERICHOST;
-#ifdef NI_WITHSCOPEID
-        if (((struct sockaddr *)&httpd_remoteaddr)->sa_family == AF_INET6)
-            niflags |= NI_WITHSCOPEID;
-#endif
-        if (getnameinfo((struct sockaddr *)&httpd_remoteaddr, salen, hbuf,
-                        sizeof(hbuf), NULL, 0, niflags) != 0)
-            strlcpy(hbuf, "unknown", sizeof(hbuf));
-        strlcat(httpd_clienthost, "[", sizeof(httpd_clienthost));
-        strlcat(httpd_clienthost, hbuf, sizeof(httpd_clienthost));
-        strlcat(httpd_clienthost, "]", sizeof(httpd_clienthost));
-        salen = sizeof(httpd_localaddr);
-        if (getsockname(0, (struct sockaddr *)&httpd_localaddr, &salen) == 0) {
-            httpd_haveaddr = 1;
-        }
-
-        /* Create pre-authentication telemetry log based on client IP */
-        httpd_logfd = telemetry_log(hbuf, httpd_in, httpd_out, 0);
-    }
+    httpd_clienthost = get_clienthost(0, &httpd_localip, &httpd_remoteip);
 
     /* other params should be filled in */
     if (sasl_server_new("HTTP", config_servername, NULL, NULL, NULL, NULL,
@@ -612,16 +577,21 @@ int service_main(int argc __attribute__((unused)),
     if (sasl_setprop(httpd_saslconn, SASL_SSF_EXTERNAL, &extprops_ssf) != SASL_OK)
         fatal("Failed to set SASL property", EC_TEMPFAIL);
 
-    if(iptostring((struct sockaddr *)&httpd_localaddr,
-                  salen, localip, 60) == 0) {
-        sasl_setprop(httpd_saslconn, SASL_IPLOCALPORT, localip);
-        saslprops.iplocalport = xstrdup(localip);
+    if (httpd_localip) {
+        sasl_setprop(httpd_saslconn, SASL_IPLOCALPORT, httpd_localip);
+        saslprops.iplocalport = xstrdup(httpd_localip);
     }
 
-    if(iptostring((struct sockaddr *)&httpd_remoteaddr,
-                  salen, remoteip, 60) == 0) {
-        sasl_setprop(httpd_saslconn, SASL_IPREMOTEPORT, remoteip);
-        saslprops.ipremoteport = xstrdup(remoteip);
+    if (httpd_remoteip) {
+        char hbuf[NI_MAXHOST], *p;
+
+        sasl_setprop(httpd_saslconn, SASL_IPREMOTEPORT, httpd_remoteip);
+        saslprops.ipremoteport = xstrdup(httpd_remoteip);
+
+        /* Create pre-authentication telemetry log based on client IP */
+        strlcpy(hbuf, httpd_remoteip, NI_MAXHOST);
+        if ((p = strchr(hbuf, ';'))) *p = '\0';
+        httpd_logfd = telemetry_log(hbuf, httpd_in, httpd_out, 0);
     }
 
     /* See which auth schemes are available to us */
@@ -1445,7 +1415,8 @@ static void cmdloop(void)
         if (!txn.flags.ver1_0) alarm(httpd_keepalive);
 
         /* Process the requested method */
-        ret = (*meth_t->proc)(&txn, meth_t->params);
+        if (namespace->premethod) ret = namespace->premethod(&txn);
+        if (!ret) ret = (*meth_t->proc)(&txn, meth_t->params);
 
       need_auth:
         if (ret == HTTP_UNAUTHORIZED) {
@@ -1826,12 +1797,15 @@ EXPORTED void allow_hdr(const char *hdr, unsigned allow)
     comma_list_hdr(hdr, meths, allow);
 
     if (allow & ALLOW_DAV) {
-        prot_printf(httpd_out, "%s: PROPFIND, REPORT", hdr);
-        if (allow & ALLOW_WRITE) {
-            prot_puts(httpd_out, ", COPY, MOVE, LOCK, UNLOCK");
+        if (allow & ALLOW_READ) {
+            prot_printf(httpd_out, "%s: PROPFIND, REPORT, COPY", hdr);
+            if (allow & ALLOW_DELETE) prot_puts(httpd_out, ", MOVE");
         }
-        if (allow & ALLOW_WRITECOL) {
-            prot_puts(httpd_out, ", PROPPATCH, MKCOL, ACL");
+        if (allow & ALLOW_PROPPATCH) prot_puts(httpd_out, ", PROPPATCH");
+        if (allow & ALLOW_WRITE) prot_puts(httpd_out, ", LOCK, UNLOCK");
+        if (allow & ALLOW_ACL) prot_puts(httpd_out, ", ACL");
+        if (allow & ALLOW_MKCOL) {
+            prot_puts(httpd_out, ", MKCOL");
             if (allow & ALLOW_CAL) {
                 prot_printf(httpd_out, "\r\n%s: MKCALENDAR", hdr);
             }
@@ -2003,6 +1977,9 @@ EXPORTED void response_header(long code, struct transaction_t *txn)
         }
         prot_puts(httpd_out, "\r\n");
     }
+    if (resp_body->link) {
+        prot_printf(httpd_out, "Link: %s\r\n", resp_body->link);
+    }
 
     switch (code) {
     case HTTP_OK:
@@ -2022,17 +1999,14 @@ EXPORTED void response_header(long code, struct transaction_t *txn)
 
             if (txn->req_tgt.allow & ALLOW_DAV) {
                 /* Construct DAV header(s) based on namespace of request URL */
-                prot_printf(httpd_out,
-                            "DAV: 1,%s 3, access-control%s\r\n",
-                            (txn->req_tgt.allow & ALLOW_WRITE) ? " 2," : "",
-                            (txn->req_tgt.allow & ALLOW_WRITECOL) ?
-                            ", extended-mkcol" : "");
+                prot_puts(httpd_out, "DAV: 1, 2, 3, access-control,"
+                          " extended-mkcol, resource-sharing\r\n");
                 if (txn->req_tgt.allow & ALLOW_CAL) {
                     prot_printf(httpd_out, "DAV: calendar-access%s%s%s\r\n",
-                                (txn->req_tgt.allow & ALLOW_CAL_AVAIL) ?
-                                ", calendar-availability" : "",
                                 (txn->req_tgt.allow & ALLOW_CAL_SCHED) ?
                                 ", calendar-auto-schedule" : "",
+                                (txn->req_tgt.allow & ALLOW_CAL_AVAIL) ?
+                                ", calendar-availability" : "",
                                 (txn->req_tgt.allow & ALLOW_CAL_NOTZ) ?
                                 ", calendar-no-timezone" : "");
                     if (txn->req_tgt.allow & ALLOW_CAL_ATTACH) {
@@ -2041,15 +2015,13 @@ EXPORTED void response_header(long code, struct transaction_t *txn)
                                   "calendar-managed-attachments-no-recurrence\r\n");
                     }
 
-                    /* Backwards compatibility with older Apple VAV clients */
-                    if ((txn->req_tgt.allow &
-                         (ALLOW_CAL_AVAIL | ALLOW_CAL_SCHED)) ==
-                        (ALLOW_CAL_AVAIL | ALLOW_CAL_SCHED)) {
-                        if ((hdr = spool_getheader(txn->req_hdrs, "User-Agent"))
-                            && strstr(hdr[0], "CalendarAgent/")) {
-                            prot_puts(httpd_out, "DAV: inbox-availability\r\n");
-                        }
-                    }
+                    /* Backwards compatibility with older Apple clients */
+                    prot_printf(httpd_out,
+                                "DAV: calendarserver-sharing%s\r\n",
+                                (txn->req_tgt.allow &
+                                 (ALLOW_CAL_AVAIL | ALLOW_CAL_SCHED)) ==
+                                (ALLOW_CAL_AVAIL | ALLOW_CAL_SCHED) ?
+                                ", inbox-availability" : "");
                 }
                 if (txn->req_tgt.allow & ALLOW_CARD) {
                     prot_puts(httpd_out, "DAV: addressbook\r\n");
@@ -2060,13 +2032,15 @@ EXPORTED void response_header(long code, struct transaction_t *txn)
                 /* Access-Control-Allow-Methods supersedes Allow */
                 break;
             }
-            else goto allow;
+            else {
+                /* Construct Allow header(s) */
+                allow_hdr("Allow", txn->req_tgt.allow);
+            }
         }
         goto authorized;
 
     case HTTP_NOT_ALLOWED:
-    allow:
-        /* Construct Allow header(s) for OPTIONS and 405 response */
+        /* Construct Allow header(s) for 405 response */
         allow_hdr("Allow", txn->req_tgt.allow);
         goto authorized;
 

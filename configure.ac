@@ -92,18 +92,23 @@ AC_ARG_WITH(extraident,
 
 AM_MAINTAINER_MODE
 
+dnl Coverage (disabled by default)
+GCOV_CFLAGS=
+GCOV_CXXFLAGS=
+GCOV_LDFLAGS=
+GCOV_LIBS=
+
 AC_ARG_ENABLE(coverage,
-        [AS_HELP_STRING([--enable-coverage],[enable C test coverage])],
-        [GCOV_CFLAGS="--coverage"
-         GCOV_CXXFLAGS="--coverage"
-         GCOV_LDFLAGS="--coverage"
-         GCOV_LIBS="-lgcov"
-        ],[
-         GCOV_CFLAGS=
-         GCOV_CXXFLAGS=
-         GCOV_LDFLAGS=
-         GCOV_LIBS=
-        ])
+    AS_HELP_STRING([--enable-coverage],[enable C test coverage])
+)
+
+AS_IF([test "x$enable_coverage" = "xyes"], [
+    GCOV_CFLAGS="--coverage"
+    GCOV_CXXFLAGS="--coverage"
+    GCOV_LDFLAGS="--coverage"
+    GCOV_LIBS="-lgcov"
+])
+
 AC_SUBST(GCOV_CFLAGS)
 AC_SUBST(GCOV_CXXFLAGS)
 AC_SUBST(GCOV_LDFLAGS)
@@ -1507,6 +1512,23 @@ AC_ARG_ENABLE(replication,
 AM_CONDITIONAL([REPLICATION], [test "$enable_replication" != no])
 
 dnl
+dnl see if we're compiling backup support programs
+dnl
+AC_ARG_ENABLE(backup,
+        [AS_HELP_STRING([--enable-backup], [enable backup support (experimental)])],,[enable_backup="no";])
+AM_CONDITIONAL([BACKUP], [test "$enable_backup" != no])
+
+if test "x$enable_backup" != xno; then
+    if test "x$HAVE_SQLITE" != x1; then
+        AC_MSG_ERROR([Need sqlite3 for backups])
+    else
+        use_sqlite="yes"
+    fi
+
+    AC_DEFINE([ENABLE_BACKUP],[],[Build with backup support])
+fi
+
+dnl
 dnl Try and find a system version of com_err.
 dnl If we see something that looks a little wacky, ignore it (there are many
 dnl deficient installs of com_err, unfortunately, which leave out compile_et)
@@ -2070,6 +2092,7 @@ Cyrus Server configured components
    sieve:              $enable_sieve
    calalarmd:          $enable_calalarmd
    objectstore:        $enable_objectstore
+   backup:             $enable_backup
 
 External dependencies:
    ldap:               $have_ldap

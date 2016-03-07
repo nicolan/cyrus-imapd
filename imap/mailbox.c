@@ -3210,6 +3210,10 @@ static int mailbox_update_dav(struct mailbox *mailbox,
                               const struct index_record *old,
                               struct index_record *new)
 {
+    /* never have DAV on deleted mailboxes */
+    if (mboxname_isdeletedmailbox(mailbox->name, NULL))
+        return 0;
+
     if (mailbox->mbtype & MBTYPE_ADDRESSBOOK)
         return mailbox_update_carddav(mailbox, old, new);
     if (mailbox->mbtype & MBTYPE_CALENDAR)
@@ -3297,7 +3301,6 @@ static int mailbox_update_conversations(struct mailbox *mailbox,
                                         struct index_record *new)
 {
     int r = 0;
-    mbname_t *mbname;
     conversation_t *conv = NULL;
     int delta_num_records = 0;
     int delta_exists = 0;
@@ -3317,18 +3320,6 @@ static int mailbox_update_conversations(struct mailbox *mailbox,
     if (!cstate)
         return IMAP_CONVERSATIONS_NOT_OPEN;
 
-    /* IRIS-2534: check if it's the trash folder - XXX - should be separate
-     * conversation root or similar more useful method in future */
-    mbname = mbname_from_intname(mailbox->name);
-    if (!mbname)
-        return IMAP_MAILBOX_BADNAME;
-
-    const strarray_t *boxes = mbname_boxes(mbname);
-    if (strarray_size(boxes) == 1 && !strcmpsafe(strarray_nth(boxes, 0), "Trash"))
-        is_trash = 1;
-
-    mbname_free(&mbname);
-
     /* handle unlinked items as if they didn't exist */
     if (old && (old->system_flags & FLAG_UNLINKED)) old = NULL;
     if (new && (new->system_flags & FLAG_UNLINKED)) new = NULL;
@@ -3337,26 +3328,28 @@ static int mailbox_update_conversations(struct mailbox *mailbox,
         return 0;
 
     if (old && new) {
+        /* we're always moving forwards */
         assert(old->uid == new->uid);
         assert(old->modseq <= new->modseq);
+
         /* this flag cannot go away */
         if ((old->system_flags & FLAG_EXPUNGED))
             assert((new->system_flags & FLAG_EXPUNGED));
 
+        /* we're changing the CID for any reason at all, treat as
+         * a removal and re-add, so cache gets parsed and msgids
+         * updated */
         if (old->cid != new->cid) {
-            /* handle CID being renamed, by calling ourselves.  Always remove
-             * BEFORE adding so that the old 'B' record can be deleted, and
-             * hence the old CID be cleaned up in a rename case */
             r = mailbox_update_conversations(mailbox, old, NULL);
-            if (!r && new->cid) /* handle ctl_conversationdb -z correctly */
-                r = mailbox_update_conversations(mailbox, NULL, new);
-            return r;
+            if (r) return r;
+            return mailbox_update_conversations(mailbox, NULL, new);
         }
     }
 
     if (new && !old) {
         /* add the conversation */
-        mailbox_cacherecord(mailbox, new); /* make sure it's loaded */
+        r = mailbox_cacherecord(mailbox, new); /* make sure it's loaded */
+        if (r) return r;
         r = message_update_conversations(cstate, new, &conv);
         if (r) return r;
         record = new;
@@ -3369,8 +3362,7 @@ static int mailbox_update_conversations(struct mailbox *mailbox,
         if (!record->cid) return 0;
 
         r = conversation_load(cstate, record->cid, &conv);
-        if (r)
-            return r;
+        if (r) return r;
         if (!conv) {
             if (!new) {
                 /* We're trying to delete a conversation that's already
@@ -3385,6 +3377,18 @@ static int mailbox_update_conversations(struct mailbox *mailbox,
 
     if (cstate->counted_flags)
         delta_counts = xzmalloc(sizeof(int) * cstate->counted_flags->count);
+
+    /* IRIS-2534: check if it's the trash folder - XXX - should be separate
+     * conversation root or similar more useful method in future */
+    mbname_t *mbname = mbname_from_intname(mailbox->name);
+    if (!mbname)
+        return IMAP_MAILBOX_BADNAME;
+
+    const strarray_t *boxes = mbname_boxes(mbname);
+    if (strarray_size(boxes) == 1 && !strcmpsafe(strarray_nth(boxes, 0), "Trash"))
+        is_trash = 1;
+
+    mbname_free(&mbname);
 
     /* calculate the changes */
     if (old) {
@@ -3407,6 +3411,7 @@ static int mailbox_update_conversations(struct mailbox *mailbox,
         delta_num_records--;
         modseq = MAX(modseq, old->modseq);
     }
+
     if (new) {
         /* add any counts */
         if (!(new->system_flags & FLAG_EXPUNGED)) {
@@ -3432,7 +3437,7 @@ static int mailbox_update_conversations(struct mailbox *mailbox,
     if (!mailbox_cacherecord(mailbox, record)) {
         char *env = NULL;
         char *envtokens[NUMENVTOKENS];
-        struct address addr = { NULL, NULL, NULL, NULL, NULL, NULL };
+        struct address addr = { NULL, NULL, NULL, NULL, NULL, NULL, 0 };
 
         /* Need to find the sender */
 
@@ -5234,7 +5239,8 @@ HIDDEN int mailbox_rename_copy(struct mailbox *oldmailbox,
     /* we can't rename back from a deleted mailbox, because the conversations
      * information will be wrong.  Ideally we might re-calculate, but for now
      * we just throw a big fat error */
-    if (mboxname_isdeletedmailbox(oldmailbox->name, NULL)) {
+    if (config_getswitch(IMAPOPT_CONVERSATIONS) &&
+        mboxname_isdeletedmailbox(oldmailbox->name, NULL)) {
         syslog(LOG_ERR, "can't rename a deleted mailbox %s", oldmailbox->name);
         return IMAP_MAILBOX_BADNAME;
     }

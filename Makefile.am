@@ -42,8 +42,8 @@
 #
 
 ACLOCAL_AMFLAGS = -I cmulocal
-AM_CFLAGS = @PERL_CCCDLFLAGS@ $(COV_CFLAGS)
-AM_CXXFLAGS = $(COV_CXXFLAGS)
+AM_CFLAGS = @PERL_CCCDLFLAGS@ $(GCOV_CFLAGS)
+AM_CXXFLAGS = $(GCOV_CXXFLAGS)
 
 AM_CPPFLAGS = \
 	$(COM_ERR_CPPFLAGS) \
@@ -118,6 +118,7 @@ libexec_PROGRAMS =
 sbin_PROGRAMS =
 noinst_HEADERS =
 noinst_LTLIBRARIES =
+noinst_PROGRAMS =
 CLEANFILES =
 EXTRA_DIST = \
 	$(wildcard tools/vzic/*)
@@ -238,6 +239,13 @@ if REPLICATION
 libexec_PROGRAMS += imap/sync_server
 sbin_PROGRAMS += imap/sync_client imap/sync_reset
 endif # REPLICATION
+
+if BACKUP
+noinst_LTLIBRARIES += backup/libcyrus_backup.la
+noinst_HEADERS += backup/backup.h
+libexec_PROGRAMS += backup/backupd
+sbin_PROGRAMS += backup/ctl_backups backup/cyr_backup
+endif # BACKUP
 
 if HAVE_SSL
 sbin_PROGRAMS += imap/tls_prune
@@ -591,7 +599,7 @@ com_err/et/compile_et: com_err/et/compile_et.sh com_err/et/config_script \
 # MD5 algorithms, without needing SSL.  Currently we have no way of
 # minimally linking such code.
 LD_BASIC_ADD = lib/libcyrus.la lib/libcyrus_min.la ${LIBS} $(LIB_RT) \
-	${LIB_SASL} $(SSL_LIBS)
+	${LIB_SASL} $(SSL_LIBS) $(GCOV_LIBS)
 
 # UTILITY is the libraries that utility programs which use Cyrus'
 # mailbox and message handling code need to link with.
@@ -791,6 +799,44 @@ noinst_HEADERS += \
 	lib/xstrlcat.h \
 	lib/xstrlcpy.h
 
+backup_libcyrus_backup_la_SOURCES = \
+    lib/gzuncat.c \
+    lib/gzuncat.h \
+    backup/lcb.c \
+    backup/lcb_append.c \
+    backup/lcb_backupdb.c \
+    backup/lcb_compact.c \
+    backup/lcb_indexr.c \
+    backup/lcb_indexw.c \
+    backup/lcb_internal.c \
+    backup/lcb_internal.h \
+    backup/lcb_partlist.c \
+    backup/lcb_printinfo.c \
+    backup/lcb_read.c \
+    backup/lcb_sqlconsts.c \
+    backup/lcb_sqlconsts.h \
+    backup/lcb_verify.c
+
+backup_backupd_SOURCES = \
+    imap/mutex_fake.c \
+    imap/sync_support.c \
+    imap/sync_support.h \
+    master/service.c \
+    backup/backupd.c
+backup_backupd_LDADD = $(LD_SERVER_ADD) backup/libcyrus_backup.la
+
+backup_ctl_backups_SOURCES = \
+    imap/mutex_fake.c \
+    imap/sync_support.c \
+    imap/sync_support.h \
+    backup/ctl_backups.c
+backup_ctl_backups_LDADD = $(LD_UTILITY_ADD) backup/libcyrus_backup.la
+
+backup_cyr_backup_SOURCES = \
+    imap/mutex_fake.c \
+    backup/cyr_backup.c
+backup_cyr_backup_LDADD = $(LD_UTILITY_ADD) backup/libcyrus_backup.la
+
 imap_arbitron_SOURCES = imap/arbitron.c imap/cli_fatal.c imap/mutex_fake.c
 imap_arbitron_LDADD = $(LD_UTILITY_ADD)
 
@@ -908,7 +954,7 @@ nodist_imap_libcyrus_imap_la_SOURCES = \
 
 dist_imap_libcyrus_imap_la_SOURCES =
 
-imap_libcyrus_imap_la_LIBADD = $(COM_ERR_LIBS) $(LIB_UUID) lib/libcyrus_min.la lib/libcyrus.la
+imap_libcyrus_imap_la_LIBADD = $(COM_ERR_LIBS) $(LIB_UUID) $(GCOV_LIBS) lib/libcyrus_min.la lib/libcyrus.la
 imap_libcyrus_imap_la_CFLAGS = $(AM_CFLAGS) $(CFLAG_VISIBILITY)
 imap_libcyrus_imap_la_CXXFLAGS = $(AM_CXXFLAGS)
 
@@ -1337,7 +1383,7 @@ lib_libcyrus_la_SOURCES += lib/nonblock_fcntl.c
 else
 lib_libcyrus_la_SOURCES += lib/nonblock_ioctl.c
 endif
-lib_libcyrus_la_LIBADD = libcrc32.a $(LIB_RT) ${LIB_SASL} $(SSL_LIBS)
+lib_libcyrus_la_LIBADD = libcrc32.a $(LIB_RT) ${LIB_SASL} $(SSL_LIBS) $(GCOV_LIBS)
 lib_libcyrus_la_CFLAGS = $(AM_CFLAGS) $(CFLAG_VISIBILITY)
 
 noinst_LIBRARIES = libcrc32.a
@@ -1384,7 +1430,7 @@ else
 lib_libcyrus_min_la_SOURCES += lib/map_nommap.c
 endif
 endif
-lib_libcyrus_min_la_LIBADD = $(LTLIBOBJS) $(LIB_UUID)
+lib_libcyrus_min_la_LIBADD = $(LTLIBOBJS) $(LIB_UUID) $(GCOV_LIBS)
 lib_libcyrus_min_la_CFLAGS = $(AM_CFLAGS) $(CFLAG_VISIBILITY)
 
 lib/chartable.c: lib/mkchartable.pl lib/charset/unifix.txt \
@@ -1505,7 +1551,7 @@ master_master_SOURCES = \
 	master/masterconf.c \
 	master/masterconf.h \
 	master/service.h
-master_master_LDADD = lib/libcyrus_min.la $(LIB_UCDSNMP) $(LIBS) -lm
+master_master_LDADD = lib/libcyrus_min.la $(LIB_UCDSNMP) $(LIBS) $(GCOV_LIBS) -lm
 
 
 netnews_remotepurge_SOURCES = \
@@ -1582,7 +1628,6 @@ sieve_libcyrus_sieve_la_SOURCES = \
 	sieve/bytecode.h \
 	sieve/addr.y \
 	sieve/addr-lex.l \
-	sieve/bc_dump.c \
 	sieve/bc_emit.c \
 	sieve/bc_eval.c \
 	sieve/bc_generate.c \

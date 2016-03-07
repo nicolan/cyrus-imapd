@@ -1576,6 +1576,7 @@ EXPORTED int mboxlist_renamemailbox(const char *oldname, const char *newname,
                            int local_only, int forceuser, int ignorequota)
 {
     int r;
+    int mupdatecommiterror = 0;
     long myrights;
     int isusermbox = 0; /* Are we renaming someone's inbox */
     int partitionmove = 0;
@@ -1781,6 +1782,7 @@ EXPORTED int mboxlist_renamemailbox(const char *oldname, const char *newname,
             syslog(LOG_ERR,
                    "MUPDATE: can't commit mailbox entry for '%s'",
                    newname);
+            mupdatecommiterror = r;
         }
         if (mupdate_h) mupdate_disconnect(&mupdate_h);
         free(loc);
@@ -1791,7 +1793,35 @@ EXPORTED int mboxlist_renamemailbox(const char *oldname, const char *newname,
         r = mailbox_commit(newmailbox);
 
     if (r) {
-        /* XXX - rollback DB changes if it was an mupdate failure */
+        /* rollback DB changes if it was an mupdate failure */
+        if (mupdatecommiterror) {
+            r = 0;
+
+            /* recreate an old entry */
+            if (!isusermbox)
+                r = mboxlist_update_entry(oldname, newmbentry, &tid);
+
+            /* delete the new entry */
+            if (!r)
+                r = mboxlist_update_entry(newname, NULL, &tid);
+
+            /* Commit transaction */
+            if (!r)
+                r = cyrusdb_commit(mbdb, tid);
+
+            tid = NULL;
+            if (r) {
+                /* XXX HOWTO repair this mess! */
+                syslog(LOG_ERR, "DBERROR: failed DB rollback on mailboxrename %s %s: %s",
+                       oldname, newname, cyrusdb_strerror(r));
+                syslog(LOG_ERR, "DBERROR: mailboxdb on mupdate and backend ARE NOT CONSISTENT");
+                syslog(LOG_ERR, "DBERROR: mailboxdb on mupdate has entry for %s, mailboxdb on backend has entry for %s and files are on the old position", oldname, newname);
+                r = IMAP_IOERROR;
+            } else {
+                r = mupdatecommiterror;
+            }
+        }
+
         if (newmailbox) mailbox_delete(&newmailbox);
         if (partitionmove && newpartition)
             mailbox_delete_cleanup(NULL, newpartition, newname, oldmailbox->uniqueid);
@@ -3346,6 +3376,64 @@ done:
     }
     return list;
 }
+
+
+
+struct submb_rock {
+    struct mboxlist_entry *mbentry;
+    const char *userid;
+    int flags;
+    mboxlist_cb *proc;
+    void *rock;
+};
+
+static int usersubs_cb(void *rock, const char *key, size_t keylen,
+                      const char *data __attribute__((unused)),
+                      size_t datalen __attribute__((unused)))
+{
+    struct submb_rock *mbrock = (struct submb_rock *) rock;
+    char mboxname[MAX_MAILBOX_NAME+1];
+    int r;
+
+    /* free previous record */
+    mboxlist_entry_free(&mbrock->mbentry);
+
+    snprintf(mboxname, MAX_MAILBOX_NAME, "%.*s", (int) keylen, key);
+
+    if ((mbrock->flags & MBOXTREE_SKIP_PERSONAL) &&
+        mboxname_userownsmailbox(mbrock->userid, mboxname)) return 0;
+
+    r = mboxlist_lookup(mboxname, &mbrock->mbentry, NULL);
+    if (r) {
+        syslog(LOG_INFO, "mboxlist_lookup(%s) failed: %s",
+               key, error_message(r));
+        return r;
+    }
+
+    return mbrock->proc(mbrock->mbentry, mbrock->rock);
+}
+
+EXPORTED int mboxlist_usersubs(const char *userid, mboxlist_cb *proc,
+                               void *rock, int flags)
+{
+    struct db *subs = NULL;
+    struct submb_rock mbrock = { NULL, userid, flags, proc, rock };
+    int r = 0;
+
+    /* open subs DB */
+    r = mboxlist_opensubs(userid, &subs);
+    if (r) return r;
+
+    /* faster to do it all in a single slurp! */
+    r = cyrusdb_foreach(subs, "", 0, NULL, usersubs_cb, &mbrock, 0);
+
+    mboxlist_entry_free(&mbrock.mbentry);
+
+    mboxlist_closesubs(subs);
+
+    return r;
+}
+
 
 
 

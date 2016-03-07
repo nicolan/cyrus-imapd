@@ -220,7 +220,7 @@ struct meth_params webdav_params = {
     &webdav_get,
     { 0, MBTYPE_COLLECTION },                   /* Allow any location */
     NULL,                                       /* No PATCH handling */
-    NULL,                                       /* No special POST handling */
+    { POST_ADDMEMBER, NULL },                   /* No special POST handling */
     { 0, &webdav_put },                         /* Allow any MIME type */
     { DAV_FINITE_DEPTH, webdav_props},
     webdav_reports
@@ -232,8 +232,9 @@ struct namespace_t namespace_drive = {
     URL_NS_DRIVE, 0, "/dav/drive", NULL, 1 /* auth */,
     MBTYPE_COLLECTION,
     (ALLOW_READ | ALLOW_POST | ALLOW_WRITE | ALLOW_DELETE |
-     ALLOW_DAV | ALLOW_WRITECOL),
+     ALLOW_DAV | ALLOW_PROPPATCH | ALLOW_MKCOL | ALLOW_ACL),
     &my_webdav_init, &my_webdav_auth, my_webdav_reset, &my_webdav_shutdown,
+    &dav_premethod,
     {
         { &meth_acl,            &webdav_params },      /* ACL          */
         { NULL,                 NULL },                /* BIND         */
@@ -374,22 +375,34 @@ static int webdav_parse_path(const char *path,
         return HTTP_FORBIDDEN;
     }
 
-    tgt->prefix = namespace_drive.prefix;
+    tgt->urlprefix = namespace_drive.prefix;
+    tgt->mboxprefix = config_getstring(IMAPOPT_DAVDRIVEPREFIX);
+
+    /* Default to bare-bones Allow bits */
+    tgt->allow &= ALLOW_READ_MASK;
 
     /* Skip namespace */
     p += len;
     if (!*p || !*++p) {
         /* Make sure collection is terminated with '/' */
         if (p[-1] != '/') *p++ = '/';
+
+        tgt->flags = TGT_DRIVE_ROOT;
     }
 
     /* Check if we're in user space */
     len = strcspn(p, "/");
-    if (len && !strncmp(p, "user", len)) {
+    if (len && !strncmp(p, USER_COLLECTION_PREFIX, len)) {
         p += len;
         if (!*p || !*++p) {
+            /* Make sure collection is terminated with '/' */
+            if (p[-1] != '/') *p++ = '/';
+
+            tgt->flags = TGT_DRIVE_USER;
+
+            /* Create pseudo entry for /dav/drive/user */
             tgt->mbentry = mboxlist_entry_create();
-            tgt->mbentry->name = xstrdup("user");
+            tgt->mbentry->name = xstrdup(USER_COLLECTION_PREFIX);
             tgt->userid = xstrdup("");
             tgt->mbentry->acl = xstrdup("anyone\tlr\t");
             tgt->mbentry->mbtype = MBTYPE_COLLECTION;
@@ -478,7 +491,9 @@ static int webdav_parse_path(const char *path,
     mbname_free(&mbname);
 
     /* Set proper Allow bits based on path components */
-    if (tgt->resource) tgt->allow &= ~ALLOW_WRITECOL;
+    tgt->allow |= ALLOW_ACL | ALLOW_PROPPATCH | ALLOW_WRITE | ALLOW_DELETE;
+
+    if (!tgt->resource) tgt->allow |= ALLOW_POST | ALLOW_MKCOL;
 
     return 0;
 }
@@ -497,7 +512,7 @@ static int webdav_get(struct transaction_t *txn,
         buf_printf(&txn->buf, "%s/%s", wdata->type, wdata->subtype);
         txn->resp_body.type = buf_cstring(&txn->buf);
         txn->resp_body.fname = wdata->filename;
-        return 0;
+        return HTTP_CONTINUE;
     }
 
     /* Get on a user/collection */

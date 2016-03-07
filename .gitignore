@@ -23,6 +23,12 @@ Makefile.old
 makedepend.log
 aclocal.m4
 autom4te.cache/
+backup/backupd
+backup/bu_lock
+backup/ctl_backups
+backup/cyr_backup
+backup/reindex
+backup/verify
 cmulocal/
 compile
 config.guess

@@ -118,6 +118,7 @@ enum {
 enum {
     URL_NS_DEFAULT = 0,
     URL_NS_PRINCIPAL,
+    URL_NS_NOTIFY,
     URL_NS_CALENDAR,
     URL_NS_FREEBUSY,
     URL_NS_ADDRESSBOOK,
@@ -139,16 +140,26 @@ enum {
     ALLOW_PATCH =       (1<<3), /* Patch resources */
     ALLOW_DELETE =      (1<<4), /* Delete resources/collections */
     ALLOW_TRACE =       (1<<5), /* TRACE a request */
-    ALLOW_DAV =         (1<<6), /* WebDAV specific methods/features */
-    ALLOW_WRITECOL =    (1<<7), /* Create/modify collections */
-    ALLOW_CAL =         (1<<8), /* CalDAV specific methods/features */
-    ALLOW_CAL_AVAIL =   (1<<9), /* CalDAV Availability specific features */
-    ALLOW_CAL_SCHED =   (1<<10),/* CalDAV Scheduling specific features */
-    ALLOW_CAL_NOTZ =    (1<<11),/* CalDAV TZ by Ref specific features */
-    ALLOW_CAL_ATTACH =  (1<<12),/* CalDAV Managed Attachments features */
-    ALLOW_CARD =        (1<<13),/* CardDAV specific methods/features */
-    ALLOW_ISCHEDULE =   (1<<14) /* iSchedule specific methods/features */
+
+    ALLOW_DAV =         (1<<8), /* WebDAV specific methods/features */
+    ALLOW_PROPPATCH  =  (1<<9), /* Modify properties */
+    ALLOW_MKCOL =       (1<<10),/* Create collections */
+    ALLOW_ACL =         (1<<11),/* Modify access control list */
+
+    ALLOW_CAL =         (1<<16),/* CalDAV specific methods/features */
+    ALLOW_CAL_SCHED =   (1<<17),/* CalDAV Scheduling specific features */
+    ALLOW_CAL_AVAIL =   (1<<18),/* CalDAV Availability specific features */
+    ALLOW_CAL_NOTZ =    (1<<19),/* CalDAV TZ by Ref specific features */
+    ALLOW_CAL_ATTACH =  (1<<20),/* CalDAV Managed Attachments features */
+
+    ALLOW_CARD =        (1<<24),/* CardDAV specific methods/features */
+
+    ALLOW_ISCHEDULE =   (1<<31) /* iSchedule specific methods/features */
 };
+
+#define ALLOW_READ_MASK ~(ALLOW_POST|ALLOW_WRITE|ALLOW_DELETE|ALLOW_PATCH\
+                          |ALLOW_PROPPATCH|ALLOW_MKCOL|ALLOW_ACL)
+
 
 struct auth_scheme_t {
     unsigned idx;               /* Index value of the scheme */
@@ -206,15 +217,19 @@ struct request_target_t {
     unsigned long allow;        /* bitmask of allowed features/methods */
     int mboxtype;               /* mailbox types to match on findall */
     mbentry_t *mbentry;         /* mboxlist entry of target collection */
-    const char *prefix;         /* namespace prefix */
+    const char *urlprefix;      /* namespace prefix */
+    const char *mboxprefix;     /* mailbox prefix */
 };
 
 /* Request target flags */
 enum {
     TGT_SERVER_INFO = 1,
+    TGT_DAV_SHARED,
     TGT_SCHED_INBOX,
     TGT_SCHED_OUTBOX,
-    TGT_MANAGED_ATTACH
+    TGT_MANAGED_ATTACH,
+    TGT_DRIVE_ROOT,
+    TGT_DRIVE_USER
 };
 
 /* Function to parse URI path and generate a mailbox name */
@@ -259,6 +274,7 @@ struct resp_body_t {
     const char *type;                   /* Content-Type     */
     const struct patch_doc_t *patch;    /* Accept-Patch     */
     unsigned prefs;                     /* Prefer           */
+    const char *link;                   /* Link             */
     const char *lock;                   /* Lock-Token       */
     const char *etag;                   /* ETag             */
     time_t lastmod;                     /* Last-Modified    */
@@ -271,16 +287,16 @@ struct resp_body_t {
 
 /* Transaction flags */
 struct txn_flags_t {
-    unsigned char ver1_0;               /* Request from HTTP/1.0 client */
-    unsigned char conn;                 /* Connection opts on req/resp */
-    unsigned char override;             /* HTTP method override */
-    unsigned char cors;                 /* Cross-Origin Resource Sharing */
-    unsigned char mime;                 /* MIME-conformant response */
-    unsigned char te;                   /* Transfer-Encoding for resp */
-    unsigned char cc;                   /* Cache-Control directives for resp */
-    unsigned char ranges;               /* Accept range requests for resource */
-    unsigned char vary;                 /* Headers on which response varied */
-    unsigned char trailer;              /* Headers which will be in trailer */
+    unsigned long ver1_0   : 1;         /* Request from HTTP/1.0 client */
+    unsigned long conn     : 3;         /* Connection opts on req/resp */
+    unsigned long override : 1;         /* HTTP method override */
+    unsigned long cors     : 3;         /* Cross-Origin Resource Sharing */
+    unsigned long mime     : 1;         /* MIME-conformant response */
+    unsigned long te       : 3;         /* Transfer-Encoding for resp */
+    unsigned long cc       : 7;         /* Cache-Control directives for resp */
+    unsigned long ranges   : 1;         /* Accept range requests for resource */
+    unsigned long vary     : 4;         /* Headers on which response varied */
+    unsigned long trailer  : 1;         /* Headers which will be in trailer */
 };
 
 /* Transaction context */
@@ -362,9 +378,8 @@ enum {
     TRAILER_CMD5 =      (1<<0)  /* Content-MD5 */
 };
 
+typedef int (*premethod_proc_t)(struct transaction_t *txn);
 typedef int (*method_proc_t)(struct transaction_t *txn, void *params);
-typedef int (*filter_proc_t)(struct transaction_t *txn,
-                             const char *base, unsigned long len);
 
 struct method_t {
     method_proc_t proc;         /* Function to perform the method */
@@ -379,10 +394,11 @@ struct namespace_t {
     unsigned need_auth;         /* Do we need to auth for this namespace? */
     int mboxtype;               /* What mbtype can be seen in this namespace? */
     unsigned long allow;        /* Bitmask of allowed features/methods */
-    void (*init)(struct buf *serverinfo);
-    void (*auth)(const char *userid);
-    void (*reset)(void);
-    void (*shutdown)(void);
+    void (*init)(struct buf *); /* Function run during service startup */
+    void (*auth)(const char *); /* Function run after authentication */
+    void (*reset)(void);        /* Function run before change in auth */
+    void (*shutdown)(void);     /* Function run during service shutdown */
+    int (*premethod)(struct transaction_t *); /* Func run prior to any method */
     struct method_t methods[];  /* Array of functions to perform HTTP methods.
                                  * MUST be an entry for EACH method listed,
                                  * and in the SAME ORDER in which they appear
@@ -400,6 +416,7 @@ struct accept {
 
 extern struct namespace_t namespace_default;
 extern struct namespace_t namespace_principal;
+extern struct namespace_t namespace_notify;
 extern struct namespace_t namespace_calendar;
 extern struct namespace_t namespace_freebusy;
 extern struct namespace_t namespace_addressbook;
@@ -429,7 +446,7 @@ extern char *httpd_extrafolder;
 extern char *httpd_extradomain;
 extern struct auth_state *httpd_authstate;
 extern struct namespace httpd_namespace;
-extern struct sockaddr_storage httpd_localaddr, httpd_remoteaddr;
+extern const char *httpd_localip, *httpd_remoteip;
 extern unsigned long config_httpmodules;
 extern int config_httpprettytelemetry;
 
