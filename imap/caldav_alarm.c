@@ -765,9 +765,17 @@ EXPORTED int caldav_alarm_process()
         struct index_record record;
         memset(&record, 0, sizeof(struct index_record));
         rc = mailbox_find_index_record(mailbox, cdata->dav.imap_uid, &record);
+        if (rc == IMAP_NOTFOUND) {
+            /* no record, no worries */
+            goto done_item;
+        }
         if (rc) {
             /* XXX no index record? item deleted or transient error? */
             scan->do_delete = 0;
+            goto done_item;
+        }
+        if (record.system_flags & FLAG_EXPUNGED) {
+            /* no longer exists?  nothing to do */
             goto done_item;
         }
 
@@ -780,7 +788,7 @@ EXPORTED int caldav_alarm_process()
 
         ical = icalparser_parse_string(buf_cstring(&msg_buf) + record.header_size);
 
-        rc = annotatemore_lookup(mailbox->name, displayname_annot, NULL, &calname_buf);
+        rc = annotatemore_lookupmask(mailbox->name, displayname_annot, userid, &calname_buf);
         if (rc || !calname_buf.len) buf_setcstr(&calname_buf, strrchr(mailbox->name, '.') + 1);
 
         mailbox_close(&mailbox);

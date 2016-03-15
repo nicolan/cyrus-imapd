@@ -421,19 +421,82 @@ EXPORTED mbname_t *mbname_dup(const mbname_t *orig)
     return mbname;
 }
 
-static void _add_dots(char *p)
+static void _append_intbuf(struct buf *buf, const char *val)
 {
-    for (; *p; p++) {
-        if (*p == '^') *p = '.';
+    const char *p;
+    for (p = val; *p; p++) {
+        switch (*p) {
+        case '.':
+            buf_putc(buf, '^');
+            break;
+        default:
+            buf_putc(buf, *p);
+            break;
+        }
     }
 }
 
-static void _rm_dots(char *p)
+static strarray_t *_array_from_intname(strarray_t *a)
 {
-    for (; *p; p++) {
-        if (*p == '.') *p = '^';
+    int i;
+    for (i = 0; i < strarray_size(a); i++) {
+        char *p;
+        for (p = a->data[i]; *p; p++) {
+            switch (*p) {
+            case '^':
+                *p = '.';
+                break;
+            default:
+                break;
+            }
+        }
+    }
+    return a;
+}
+
+static void _append_extbuf(const struct namespace *ns, struct buf *buf, const char *val)
+{
+    const char *p;
+    int isuhs = (ns->hier_sep == '/');
+    for (p = val; *p; p++) {
+        switch (*p) {
+        case '.':
+            if (isuhs) buf_putc(buf, '.');
+            else buf_putc(buf, '^');
+            break;
+        default:
+            buf_putc(buf, *p);
+            break;
+        }
     }
 }
+
+static strarray_t *_array_from_extname(const struct namespace *ns, strarray_t *a)
+{
+    int i;
+    int isuhs = (ns->hier_sep == '/');
+    for (i = 0; i < strarray_size(a); i++) {
+        char *p;
+        for (p = a->data[i]; *p; p++) {
+            switch (*p) {
+            case '^':
+                if (isuhs) goto err;
+                else *p = '.';
+                break;
+            case '/':
+                goto err;
+            default:
+                break;
+            }
+        }
+    }
+    return a;
+
+err:
+    strarray_free(a);
+    return NULL;
+}
+
 
 EXPORTED mbname_t *mbname_from_intname(const char *intname)
 {
@@ -460,11 +523,7 @@ EXPORTED mbname_t *mbname_from_intname(const char *intname)
         intname = p+1;
     }
 
-    mbname->boxes = strarray_split(intname, ".", 0);
-    int i;
-    for (i = 0; i < mbname->boxes->count; i++) {
-        _add_dots(mbname->boxes->data[i]);
-    }
+    mbname->boxes = _array_from_intname(strarray_split(intname, ".", 0));
 
     if (!strarray_size(mbname->boxes))
         return mbname;
@@ -487,6 +546,7 @@ EXPORTED mbname_t *mbname_from_intname(const char *intname)
 EXPORTED mbname_t *mbname_from_extname(const char *extname, const struct namespace *ns, const char *userid)
 {
     int crossdomains = config_getswitch(IMAPOPT_CROSSDOMAINS) && !ns->isadmin;
+    int cdother = config_getswitch(IMAPOPT_CROSSDOMAINS_ONLYOTHER);
     /* old-school virtdomains requires admin to be a different domain than the userid */
     int admindomains = config_virtdomains && ns->isadmin;
 
@@ -508,9 +568,12 @@ EXPORTED mbname_t *mbname_from_extname(const char *extname, const struct namespa
     if (!*extname)
         return mbname; // empty string, *sigh*
 
-    mbname_t *userparts = mbname_from_userid(userid);
+    sepstr[0] = ns->hier_sep;
+    sepstr[1] = '\0';
 
     mbname->extname = xstrdup(extname); // may as well cache it
+
+    mbname_t *userparts = mbname_from_userid(userid);
 
     if (admindomains) {
         p = strchr(mbname->extname, '@');
@@ -529,11 +592,12 @@ EXPORTED mbname_t *mbname_from_extname(const char *extname, const struct namespa
         mbname->domain = xstrdupnull(mbname_domain(userparts));
     }
 
-    sepstr[0] = ns->hier_sep;
-    sepstr[1] = '\0';
+    mbname->boxes = _array_from_extname(ns, strarray_split(mbname->extname, sepstr, 0));
 
-    mbname->boxes = strarray_split(mbname->extname, sepstr, 0);
     if (p) *p = '@'; // rebuild extname for later use
+
+    if (!mbname->boxes)
+        goto done;
 
     if (!strarray_size(mbname->boxes))
         goto done;
@@ -548,12 +612,15 @@ EXPORTED mbname_t *mbname_from_extname(const char *extname, const struct namespa
             /* other user namespace */
             free(strarray_shift(mbname->boxes));
             mbname->localpart = strarray_shift(mbname->boxes);
-            if (crossdomains) {
+            if (crossdomains && mbname->localpart) {
                 char *p = strchr(mbname->localpart, '@');
                 if (p) {
                     *p = '\0';
                     if (strcmpsafe(p+1, config_defdomain))
                         mbname->domain = xstrdup(p+1);
+                }
+                else if (cdother) {
+                    mbname->domain = xstrdupnull(mbname_domain(userparts));
                 }
                 /* otherwise it must be in defdomain.  Domains are
                  * always specified in crossdomains */
@@ -609,12 +676,15 @@ EXPORTED mbname_t *mbname_from_extname(const char *extname, const struct namespa
     if (!strcmpsafe(strarray_nth(mbname->boxes, 0), "user")) {
         free(strarray_shift(mbname->boxes));
         mbname->localpart = strarray_shift(mbname->boxes);
-        if (crossdomains) {
+        if (crossdomains && mbname->localpart) {
             char *p = strchr(mbname->localpart, '@');
             if (p) {
                 *p = '\0';
                 if (strcmpsafe(p+1, config_defdomain))
                     mbname->domain = xstrdup(p+1);
+            }
+            else if (cdother) {
+                mbname->domain = xstrdupnull(mbname_domain(userparts));
             }
         }
         goto done;
@@ -704,19 +774,13 @@ EXPORTED const char *mbname_intname(const mbname_t *mbname)
     if (mbname->localpart) {
         if (sep) buf_putc(&buf, '.');
         buf_appendcstr(&buf, "user.");
-        char *lp = xstrdup(mbname->localpart);
-        _rm_dots(lp);
-        buf_appendcstr(&buf, lp);
-        free(lp);
+        _append_intbuf(&buf, mbname->localpart);
         sep = 1;
     }
 
     for (i = 0; i < strarray_size(boxes); i++) {
         if (sep) buf_putc(&buf, '.');
-        char *lp = xstrdupnull(strarray_nth(boxes, i));
-        _rm_dots(lp);
-        buf_appendcstr(&buf, lp);
-        free(lp);
+        _append_intbuf(&buf, strarray_nth(boxes, i));
         sep = 1;
     }
 
@@ -820,6 +884,7 @@ EXPORTED const char *mbname_recipient(const mbname_t *mbname, const struct names
 EXPORTED const char *mbname_extname(const mbname_t *mbname, const struct namespace *ns, const char *userid)
 {
     int crossdomains = config_getswitch(IMAPOPT_CROSSDOMAINS) && !ns->isadmin;
+    int cdother = config_getswitch(IMAPOPT_CROSSDOMAINS_ONLYOTHER);
     /* old-school virtdomains requires admin to be a different domain than the userid */
     int admindomains = config_virtdomains && ns->isadmin;
 
@@ -867,7 +932,7 @@ EXPORTED const char *mbname_extname(const mbname_t *mbname, const struct namespa
             int i;
             for (i = 0; i < strarray_size(boxes); i++) {
                 buf_putc(&buf, ns->hier_sep);
-                buf_appendcstr(&buf, strarray_nth(boxes, i));
+                _append_extbuf(ns, &buf, strarray_nth(boxes, i));
             }
             goto end;
         }
@@ -876,17 +941,19 @@ EXPORTED const char *mbname_extname(const mbname_t *mbname, const struct namespa
         if (strcmpsafe(mbname_userid(mbname), userid)) {
             buf_appendcstr(&buf, up);
             buf_putc(&buf, ns->hier_sep);
-            buf_appendcstr(&buf, mbname_localpart(mbname));
+            _append_extbuf(ns, &buf, mbname_localpart(mbname));
             if (crossdomains) {
                 const char *domain = mbname_domain(mbname);
-                if (!domain) domain = config_defdomain;
-                buf_putc(&buf, '@');
-                buf_appendcstr(&buf, domain);
+                if (!cdother || strcmpsafe(domain, mbname_domain(userparts))) {
+                    if (!domain) domain = config_defdomain;
+                    buf_putc(&buf, '@');
+                    _append_extbuf(ns, &buf, domain);
+                }
             }
             int i;
             for (i = 0; i < strarray_size(boxes); i++) {
                 buf_putc(&buf, ns->hier_sep);
-                buf_appendcstr(&buf, strarray_nth(boxes, i));
+                _append_extbuf(ns, &buf, strarray_nth(boxes, i));
             }
             goto end;
         }
@@ -912,7 +979,7 @@ EXPORTED const char *mbname_extname(const mbname_t *mbname, const struct namespa
         int i;
         for (i = 0; i < strarray_size(boxes); i++) {
             if (i) buf_putc(&buf, ns->hier_sep);
-            buf_appendcstr(&buf, strarray_nth(boxes, i));
+            _append_extbuf(ns, &buf, strarray_nth(boxes, i));
         }
 
         goto end;
@@ -940,7 +1007,7 @@ EXPORTED const char *mbname_extname(const mbname_t *mbname, const struct namespa
         int i;
         for (i = 0; i < strarray_size(boxes); i++) {
             if (i) buf_putc(&buf, ns->hier_sep);
-            buf_appendcstr(&buf, strarray_nth(boxes, i));
+            _append_extbuf(ns, &buf, strarray_nth(boxes, i));
         }
 
         goto end;
@@ -950,12 +1017,14 @@ EXPORTED const char *mbname_extname(const mbname_t *mbname, const struct namespa
     if (strcmpsafe(mbname_userid(mbname), userid)) {
         buf_appendcstr(&buf, "user");
         buf_putc(&buf, ns->hier_sep);
-        buf_appendcstr(&buf, mbname_localpart(mbname));
+        _append_extbuf(ns, &buf, mbname_localpart(mbname));
         if (crossdomains) {
             const char *domain = mbname_domain(mbname);
-            if (!domain) domain = config_defdomain;
-            buf_putc(&buf, '@');
-            buf_appendcstr(&buf, domain);
+            if (!cdother || strcmpsafe(domain, mbname_domain(userparts))) {
+                if (!domain) domain = config_defdomain;
+                buf_putc(&buf, '@');
+                _append_extbuf(ns, &buf, domain);
+            }
         }
         /* shared folders can ONLY be in the same domain except for admin */
         else if (!admindomains && strcmpsafe(mbname_domain(mbname), mbname_domain(userparts)))
@@ -963,7 +1032,7 @@ EXPORTED const char *mbname_extname(const mbname_t *mbname, const struct namespa
         int i;
         for (i = 0; i < strarray_size(boxes); i++) {
             buf_putc(&buf, ns->hier_sep);
-            buf_appendcstr(&buf, strarray_nth(boxes, i));
+            _append_extbuf(ns, &buf, strarray_nth(boxes, i));
         }
         goto end;
     }
@@ -972,7 +1041,7 @@ EXPORTED const char *mbname_extname(const mbname_t *mbname, const struct namespa
     int i;
     for (i = 0; i < strarray_size(boxes); i++) {
        buf_putc(&buf, ns->hier_sep);
-       buf_appendcstr(&buf, strarray_nth(boxes, i));
+       _append_extbuf(ns, &buf, strarray_nth(boxes, i));
     }
 
  end:
@@ -1308,18 +1377,17 @@ EXPORTED int mboxname_same_userid(const char *name1, const char *name2)
 /*
  * Apply site policy restrictions on mailbox names.
  * Restrictions are hardwired for now.
+ * NOTE: '^' is '.' externally in unixhs, and invalid in unixhs
  */
-#define GOODCHARS " #$'+,-.0123456789:=@ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz~[]()?"
+#define GOODCHARS " #$'()*+,-.0123456789:=?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]^_abcdefghijklmnopqrstuvwxyz~"
 HIDDEN int mboxname_policycheck(const char *name)
 {
     const char *p;
     int sawutf7 = 0;
     unsigned c1, c2, c3, c4, c5, c6, c7, c8;
     int ucs4;
-    int unixsep;
     int namelen = strlen(name);
-
-    unixsep = config_getswitch(IMAPOPT_UNIXHIERARCHYSEP);
+    int hasdom = 0;
 
     /* Skip policy check on mailbox created in delayed delete namespace
      * assuming the mailbox existed before and was OK then.
@@ -1341,6 +1409,7 @@ HIDDEN int mboxname_policycheck(const char *name)
         if (config_virtdomains) {
             name = p + 1;
             namelen = strlen(name);
+            hasdom = 1;
         }
         else
             return IMAP_MAILBOX_BADNAME;
@@ -1433,9 +1502,7 @@ HIDDEN int mboxname_policycheck(const char *name)
             name++;             /* Skip over terminating '-' */
         }
         else {
-            /* If we're using unixhierarchysep, DOTCHAR is allowed */
-            if (!strchr(GOODCHARS, *name) &&
-                !(unixsep && *name == DOTCHAR))
+            if (!(strchr(GOODCHARS, *name) || (hasdom && *name == '!')))
                 return IMAP_MAILBOX_BADNAME;
             name++;
             sawutf7 = 0;
@@ -1508,10 +1575,8 @@ EXPORTED void mboxname_hash(char *dest, size_t destlen,
 
     int i;
     for (i = 0; i < strarray_size(boxes); i++) {
-        char *item = xstrdup(strarray_nth(boxes, i));
-        _rm_dots(item);
-        buf_printf(&buf, "/%s", item);
-        free(item);
+        buf_putc(&buf, '/');
+        _append_intbuf(&buf, strarray_nth(boxes, i));
     }
 
     /* for now, keep API even though we're doing a buffer inside here */
