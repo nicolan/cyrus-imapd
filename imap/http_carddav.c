@@ -75,6 +75,7 @@
 #include "stristr.h"
 #include "times.h"
 #include "util.h"
+#include "vcard_support.h"
 #include "version.h"
 #include "vparse.h"
 #include "xmalloc.h"
@@ -129,42 +130,12 @@ static int report_card_query(struct transaction_t *txn,
                              struct meth_params *rparams,
                              xmlNodePtr inroot, struct propfind_ctx *fctx);
 
-static struct buf *vparser_as_vcard_string_r(struct vparse_state *vparser)
-{
-    struct buf *buf = buf_new();
-
-    vparse_tobuf(vparser->card, buf);
-
-    return buf;
-}
-
-static struct vparse_state *vcard_string_as_vparser(const struct buf *buf)
-{
-    struct vparse_state *vparser;
-    int vr;
-
-    vparser = (struct vparse_state *) xzmalloc(sizeof(struct vparse_state));
-    vparser->base = buf_cstring(buf);
-    vparse_set_multival(vparser, "adr");
-    vparse_set_multival(vparser, "org");
-    vparse_set_multival(vparser, "n");
-    vr = vparse_parse(vparser, 0);
-    if (vr) return NULL; // XXX report error
-
-    return vparser;
-}
-
-static void free_vparser(void *vparser) {
-    vparse_free((struct vparse_state *) vparser);
-    free(vparser);
-}
-
 static struct mime_type_t carddav_mime_types[] = {
     /* First item MUST be the default type and storage format */
     { "text/vcard; charset=utf-8", "3.0", "vcf",
-      (struct buf* (*)(void *)) &vparser_as_vcard_string_r,
-      (void * (*)(const struct buf*)) &vcard_string_as_vparser,
-      (void (*)(void *)) &free_vparser, NULL, NULL
+      (struct buf* (*)(void *)) &vcard_as_buf,
+      (void * (*)(const struct buf*)) &vcard_parse_buf,
+      (void (*)(void *)) &vparse_free_card, NULL, NULL
     },
     { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL }
 };
@@ -278,6 +249,8 @@ static const struct prop_entry carddav_props[] = {
       propfind_fromdb, proppatch_todb, NULL },
     { "supported-address-data", NS_CARDDAV, PROP_COLLECTION,
       propfind_suppaddrdata, NULL, NULL },
+    { "supported-collation-set", NS_CARDDAV, PROP_COLLECTION,
+      propfind_collationset, NULL, NULL },
     { "max-resource-size", NS_CARDDAV, 0, NULL, NULL, NULL },
 
     /* Apple Calendar Server properties */
@@ -491,11 +464,10 @@ static int carddav_parse_path(const char *path,
  *   CARDDAV:max-resource-size
  */
 static int store_resource(struct transaction_t *txn,
-                          struct vparse_state *vparser,
+                          struct vparse_card *vcard,
                           struct mailbox *mailbox, const char *resource,
                           struct carddav_db *davdb, int dupcheck)
 {
-    struct vparse_card *vcard;
     struct vparse_entry *ventry;
     struct carddav_data *cdata;
     const char *version = NULL, *uid = NULL, *fullname = NULL;
@@ -503,8 +475,7 @@ static int store_resource(struct transaction_t *txn,
     char *mimehdr;
 
     /* Validate the vCard data */
-    if (!vparser ||
-        !(vcard = vparser->card) ||
+    if (!vcard ||
         !vcard->objects ||
         !vcard->objects->type ||
         strcasecmp(vcard->objects->type, "vcard")) {
@@ -613,11 +584,10 @@ static int store_resource(struct transaction_t *txn,
     spool_remove_header(xstrdup("Content-Description"), txn->req_hdrs);
 
     /* Store the resource */
-    struct buf buf = BUF_INITIALIZER;
-    vparse_tobuf(vparser->card, &buf);
-    int r = dav_store_resource(txn, buf_cstring(&buf), 0,
+    struct buf *buf = vcard_as_buf(vcard);
+    int r = dav_store_resource(txn, buf_cstring(buf), 0,
                               mailbox, oldrecord, NULL);
-    buf_free(&buf);
+    buf_destroy(buf);
     return r;
 }
 
@@ -626,8 +596,8 @@ static int carddav_copy(struct transaction_t *txn, void *obj,
                         void *destdb)
 {
     struct carddav_db *db = (struct carddav_db *)destdb;
-    struct vparse_state *vparser = (struct vparse_state *)obj;
-    return store_resource(txn, vparser, mailbox, resource, db, /*dupcheck*/0);
+    struct vparse_card *vcard = (struct vparse_card *)obj;
+    return store_resource(txn, vcard, mailbox, resource, db, /*dupcheck*/0);
 }
 
 static int carddav_put(struct transaction_t *txn, void *obj,
@@ -635,8 +605,8 @@ static int carddav_put(struct transaction_t *txn, void *obj,
                        void *destdb)
 {
     struct carddav_db *db = (struct carddav_db *)destdb;
-    struct vparse_state *vparser = (struct vparse_state *)obj;
-    return store_resource(txn, vparser, mailbox, resource, db, /*dupcheck*/1);
+    struct vparse_card *vcard = (struct vparse_card *)obj;
+    return store_resource(txn, vcard, mailbox, resource, db, /*dupcheck*/1);
 }
 
 
@@ -844,14 +814,341 @@ done:
     return r;
 }
 
+
+struct param_filter {
+    xmlChar *name;
+    unsigned not_defined : 1;
+    struct text_match_t *match;
+    struct param_filter *next;
+};
+
+struct prop_filter {
+    xmlChar *name;
+    unsigned allof       : 1;
+    unsigned not_defined : 1;
+    struct text_match_t *match;
+    struct param_filter *param;
+    struct prop_filter *next;
+};
+
+struct cardquery_filter {
+    unsigned allof : 1;
+    struct prop_filter *prop;
+};
+
+static int parse_textmatch(xmlNodePtr node, struct text_match_t **match)
+{
+    unsigned negate = 0, type = MATCH_TYPE_CONTAINS, collation = COLLATION_UNICODE;
+    xmlChar *attr;
+    int r = 0;
+
+    *match = NULL;
+
+    attr = xmlGetProp(node, BAD_CAST "negate-condition");
+    if (attr) {
+        if (!xmlStrcmp(attr, BAD_CAST "yes")) negate = 1;
+        else if (xmlStrcmp(attr, BAD_CAST "no")) r = CARDDAV_SUPP_FILTER;
+        xmlFree(attr);
+    }
+    attr = xmlGetProp(node, BAD_CAST "match-type");
+    if (attr) {
+        const struct match_type_t *match;
+
+        for (match = dav_match_types; match->name; match++) {
+            if (!xmlStrcmp(attr, BAD_CAST match->name)) break;
+        }
+        if (match->name) type = match->value;
+        else r = CARDDAV_SUPP_FILTER;
+        xmlFree(attr);
+    }
+    attr = xmlGetProp(node, BAD_CAST "collation");
+    if (attr) {
+        if (!xmlStrcmp(attr, BAD_CAST "default")) collation = COLLATION_UNICODE;
+        else {
+            const struct collation_t *col;
+
+            for (col = dav_collations; col->name; col++) {
+                if (!xmlStrcmp(attr, BAD_CAST col->name)) break;
+            }
+            if (col->name) collation = col->value;
+            else r = CARDDAV_SUPP_COLLATION;
+        }
+        xmlFree(attr);
+    }
+
+    if (!r) {
+        *match = xzmalloc(sizeof(struct text_match_t));
+        (*match)->text = xmlNodeGetContent(node);
+        (*match)->negate = negate;
+        (*match)->type = type;
+        (*match)->collation = collation;
+    }
+
+    return r;
+}
+
+static int parse_cardfilter(xmlNodePtr root, struct cardquery_filter *filter,
+                            struct error_t *error)
+{
+    int r = 0;
+    xmlChar *attr;
+    xmlNodePtr node;
+
+    /* Parse elements of filter */
+    attr = xmlGetProp(root, BAD_CAST "test");
+    if (attr) {
+        if (!xmlStrcmp(attr, BAD_CAST "allof")) filter->allof = 1;
+        else if (xmlStrcmp(attr, BAD_CAST "anyof")) r = CARDDAV_SUPP_FILTER;
+        xmlFree(attr);
+    }
+
+    for (node = xmlFirstElementChild(root); !r && node;
+         node = xmlNextElementSibling(node)) {
+        struct prop_filter *prop;
+        xmlNodePtr node2;
+
+        attr = NULL;
+
+        if (!xmlStrcmp(node->name, BAD_CAST "prop-filter")) {
+            attr = xmlGetProp(node, BAD_CAST "name");
+        }
+        if (!attr) {
+            r = CARDDAV_SUPP_FILTER;
+            break;
+        }
+
+        prop = xzmalloc(sizeof(struct prop_filter));
+        prop->name = attr;
+        if (filter->prop) prop->next = filter->prop;
+        filter->prop = prop;
+
+        attr = xmlGetProp(node, BAD_CAST "test");
+        if (attr) {
+            if (!xmlStrcmp(attr, BAD_CAST "allof")) prop->allof = 1;
+            else if (xmlStrcmp(attr, BAD_CAST "anyof")) r = CARDDAV_SUPP_FILTER;
+            xmlFree(attr);
+        }
+
+        for (node2 = xmlFirstElementChild(node); !r && node2;
+             node2 = xmlNextElementSibling(node2)) {
+
+            if (!xmlStrcmp(node2->name, BAD_CAST "is-not-defined")) {
+                if (prop->match || prop->param) r = CARDDAV_SUPP_FILTER;
+                else prop->not_defined = 1;
+            }
+            else if (!xmlStrcmp(node2->name, BAD_CAST "text-match")) {
+                struct text_match_t *match = NULL;
+
+                if (prop->not_defined) r = CARDDAV_SUPP_FILTER;
+                else if (!(r = parse_textmatch(node2, &match))) {
+                    if (prop->match) match->next = prop->match;
+                    prop->match = match;
+                }
+            }
+            else if (!xmlStrcmp(node2->name, BAD_CAST "param-filter")) {
+                if (prop->not_defined ||
+                    !(attr = xmlGetProp(node2, BAD_CAST "name"))) {
+                    r = CARDDAV_SUPP_FILTER;
+                }
+                else {
+                    struct param_filter *param =
+                        xzmalloc(sizeof(struct param_filter));
+                    xmlNodePtr node3;
+
+                    param->name = attr;
+                    if (prop->param) param->next = prop->param;
+                    prop->param = param;
+
+                    if ((node3 = xmlFirstElementChild(node2))) {
+                        if (!xmlStrcmp(node3->name, BAD_CAST "is-not-defined")) {
+                            param->not_defined = 1;
+                        }
+                        else if (!xmlStrcmp(node3->name, BAD_CAST "text-match")) {
+                            r = parse_textmatch(node3, &param->match);
+                        }
+                        else r = CARDDAV_SUPP_FILTER;
+                    }
+                }
+            }
+            else r = CARDDAV_SUPP_FILTER;
+        }
+    }
+
+    if (r) {
+        error->precond = r;
+        return HTTP_FORBIDDEN;
+    }
+    else return 0;
+}
+
+/* See if the current resource matches the specified filter.
+ * Returns 1 if match, 0 otherwise.
+ */
+static int apply_cardfilter(struct propfind_ctx *fctx, void *data)
+{
+    struct cardquery_filter *cardfilter =
+        (struct cardquery_filter *) fctx->filter_crit;
+    struct carddav_data *cdata = (struct carddav_data *) data;
+    struct vparse_card *vcard = NULL;
+    struct prop_filter *prop;
+    int pass = 1;
+
+    for (prop = cardfilter->prop; prop; prop = prop->next) {
+        strarray_t single = { 1, 0, NULL }, *values = NULL;
+        struct vparse_entry *entry = NULL;
+
+        if (!prop->param && !xmlStrcasecmp(prop->name, BAD_CAST "UID")) {
+            single.data = (char **) &cdata->vcard_uid;
+            values = &single;
+        }
+        else if (!prop->param && !xmlStrcasecmp(prop->name, BAD_CAST "N")) {
+            single.data = (char **) &cdata->name;
+            values = &single;
+        }
+        else if (!prop->param && !xmlStrcasecmp(prop->name, BAD_CAST "FN")) {
+            single.data = (char **) &cdata->fullname;
+            values = &single;
+        }
+        else if (!prop->param && !xmlStrcasecmp(prop->name, BAD_CAST "NICKNAME")) {
+            single.data = (char **) &cdata->nickname;
+            values = &single;
+        }
+        else {
+            /* Load message containing the resource and parse vcard data */
+            if (!vcard) {
+                int r = 0;
+
+                if (!fctx->msg_buf.len) {
+                    r = mailbox_map_record(fctx->mailbox,
+                                           fctx->record, &fctx->msg_buf);
+                }
+                if (!r) {
+                    vcard = vcard_parse_string(buf_cstring(&fctx->msg_buf) +
+                                               fctx->record->header_size);
+                }
+                if (!vcard) {
+                    pass = 0;
+                    goto done;
+                }
+            }
+
+            entry = vparse_get_entry(vcard->objects, NULL, (char *) prop->name);
+            if (entry) {
+                if (entry->multivalue) values = entry->v.values;
+                else {
+                    single.data = &entry->v.value;
+                    values = &single;
+                }
+            }
+        }
+
+        if (!values) pass = prop->not_defined;
+        else if (prop->match || prop->param) {
+            pass = prop->allof;
+
+            if (prop->match) {
+                struct text_match_t *match;
+
+                for (match = prop->match; match; match = match->next) {
+                    int n, size = strarray_size(values);
+
+                    for (n = 0; n < size; n++) {
+                        pass = dav_text_match(BAD_CAST strarray_nth(values, n),
+                                              match);
+                        if (pass) break;
+                    }
+
+                    if (pass) {
+                        if (!prop->allof) break;  /* anyof succeeds */
+                    }
+                    else if (prop->allof) break;  /* allof fails */
+
+                    pass = prop->allof;
+                }
+            }
+            if (prop->param && (pass == prop->allof)) {
+                struct param_filter *param;
+
+                for (param = prop->param; param; param = param->next) {
+                    struct vparse_param *vparam =
+                        vparse_get_param(entry, (char *) param->name);
+
+                    if (!vparam) pass = param->not_defined;
+                    else if (param->match) {
+                    }
+                    else pass = 1;
+
+                    if (pass) {
+                        if (!prop->allof) break;  /* anyof succeeds */
+                    }
+                    else if (prop->allof) break;  /* allof fails */
+
+                    pass = prop->allof;
+                }
+            }
+        }
+        else pass = 1;
+
+        if (pass) {
+            if (!cardfilter->allof) break;  /* anyof succeeds */
+        }
+        else if (cardfilter->allof) break;  /* allof fails */
+
+        pass = cardfilter->allof;
+    }
+
+  done:
+    vparse_free_card(vcard);
+
+    return pass;
+}
+
+static void free_cardfilter(struct cardquery_filter *cardfilter)
+{
+    struct prop_filter *prop, *next;
+
+    for (prop = cardfilter->prop; prop; prop = next) {
+        next = prop->next;
+
+        if (prop->match) {
+            struct text_match_t *match, *nextm;
+
+            for (match = prop->match; match; match = nextm) {
+                nextm = match->next;
+                xmlFree(match->text);
+                free(match);
+            }
+        }
+        else if (prop->param) {
+            struct param_filter *param, *nextp;
+
+            for (param = prop->param; param; param = nextp) {
+                nextp = param->next;
+                if (param->match) {
+                    xmlFree(param->match->text);
+                    free(param->match);
+                }
+                xmlFree(param->name);
+                free(param);
+            }
+        }
+
+        xmlFree(prop->name);
+        free(prop);
+    }
+}
+
 static int report_card_query(struct transaction_t *txn,
                              struct meth_params *rparams __attribute__((unused)),
                              xmlNodePtr inroot, struct propfind_ctx *fctx)
 {
     int ret = 0;
     xmlNodePtr node;
+    struct cardquery_filter cardfilter;
 
-    fctx->filter_crit = (void *) 0xDEADBEEF;  /* placeholder until we filter */
+    memset(&cardfilter, 0, sizeof(struct cardquery_filter));
+
+    fctx->filter_crit = &cardfilter;
     fctx->open_db = (db_open_proc_t) &carddav_open_mailbox;
     fctx->close_db = (db_close_proc_t) &carddav_close;
     fctx->lookup_resource = (db_lookup_proc_t) &carddav_lookup_resource;
@@ -863,8 +1160,9 @@ static int report_card_query(struct transaction_t *txn,
     for (node = inroot->children; node; node = node->next) {
         if (node->type == XML_ELEMENT_NODE) {
             if (!xmlStrcmp(node->name, BAD_CAST "filter")) {
-                txn->error.precond = CARDDAV_SUPP_FILTER;
-                return HTTP_FORBIDDEN;
+                ret = parse_cardfilter(node, &cardfilter, &txn->error);
+                if (ret) goto done;
+                else fctx->filter = apply_cardfilter;
             }
         }
     }
@@ -889,6 +1187,10 @@ static int report_card_query(struct transaction_t *txn,
 
         ret = *fctx->ret;
     }
+
+  done:
+    /* Free filter structure */
+    free_cardfilter(&cardfilter);
 
     if (fctx->davdb) {
         fctx->close_db(fctx->davdb);
