@@ -19,13 +19,7 @@ extern "C" {
 
 void xapian_init(void)
 {
-    static int init = 0;
-    static /* NOT const */ char enable_ngrams[] = "XAPIAN_CJK_NGRAM=1";
-
-    if (!init) {
-        putenv(enable_ngrams);
-        init = 1;
-    }
+    /* do nothing */
 }
 
 /* ====================================================================== */
@@ -290,7 +284,8 @@ xapian_query_t *xapian_query_new_match(const xapian_db_t *db, const char *prefix
             db->parser->set_stemming_strategy(Xapian::QueryParser::STEM_NONE);
             std::string sstr = std::string("") + str;
             Xapian::Query query = db->parser->parse_query(
-                                    sstr, /*flags*/0,
+                                    sstr,
+                                    Xapian::QueryParser::FLAG_CJK_NGRAM,
                                     std::string(prefix));
             return (xapian_query_t *)new Xapian::Query(query);
         }
@@ -310,6 +305,7 @@ xapian_query_t *xapian_query_new_match(const xapian_db_t *db, const char *prefix
     catch (const Xapian::Error &err) {
         syslog(LOG_ERR, "IOERROR: Xapian: caught exception: %s: %s",
                     err.get_context().c_str(), err.get_description().c_str());
+        return 0;
     }
 }
 
