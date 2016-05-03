@@ -75,6 +75,9 @@ int xapian_dbw_open(const char *path, xapian_dbw_t **dbwp)
         dbw->stemmer = new Xapian::Stem("en");
         dbw->term_generator->set_stemmer(*dbw->stemmer);
         dbw->term_generator->set_stemming_strategy(Xapian::TermGenerator::STEM_ALL);
+        /* Always enable CJK word tokenization */
+        dbw->term_generator->set_flags(Xapian::TermGenerator::FLAG_CJK_NGRAM,
+                ~Xapian::TermGenerator::FLAG_CJK_NGRAM);
     }
     catch (const Xapian::DatabaseLockError &err) {
         /* somebody else is already indexing this user.  They may be doing a different
