@@ -220,7 +220,6 @@ html_show_sourcelink = True
 # Output file base name for HTML help builder.
 htmlhelp_basename = 'Cyrusdoc'
 
-
 # -- Options for LaTeX output ---------------------------------------------
 
 latex_elements = {
@@ -251,10 +250,10 @@ latex_documents = [
 #latex_use_parts = False
 
 # If true, show page references after internal links.
-#latex_show_pagerefs = False
+latex_show_pagerefs = True
 
 # If true, show URL addresses after external links.
-#latex_show_urls = False
+latex_show_urls = 'footnote'
 
 # Documents to append as an appendix to all manuals.
 #latex_appendices = []
@@ -1114,7 +1113,7 @@ texinfo_documents = [
 epub_title = u'Cyrus'
 epub_author = u'The Cyrus Team'
 epub_publisher = u'The Cyrus Team'
-epub_copyright = u'2014, The Cyrus Team'
+epub_copyright = u'2017, The Cyrus Team'
 
 # The basename for the epub file. It defaults to the project name.
 epub_basename = u'Cyrus'

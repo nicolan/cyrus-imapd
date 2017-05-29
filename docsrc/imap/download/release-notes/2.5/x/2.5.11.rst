@@ -52,10 +52,10 @@ Bug fixes
 * Fixed :issue:`11`: LIST RETURN options now work properly with virtdomains
 * Fixed :issue:`44`: http proxy no longer crashes on starttls (thanks Wolfgang Breyha)
 * Fixed :issue:`1752`: no longer crash on notifyd mailto method
-* Fixed :issue:`1768`: ensure consistency of CalDav ORGANIZER (thanks Дилян Палаузов)
+* Fixed :issue:`1768`: ensure consistency of CalDav ORGANIZER (thanks Dilyan Palauzov)
 * Fixed :issue:`368`: SETACL with invalid rights characters now returns BAD
 * Fixed :issue:`46`: renames to remote destinations now work correctly
 * Fixed :issue:`38`: UTF-8 :subject now supported in sieve vacations
 * Fixed :issue:`1872`: no longer crash on bad SSL session ids
 * Fixed :issue:`1931`: missing mysql/mariadb dependencies now reported by configure
-* Fixed: various memory and resource leaks (thanks Дилян Палаузов)
+* Fixed: various memory and resource leaks (thanks Dilyan Palauzov)

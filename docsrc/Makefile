@@ -55,7 +55,7 @@ help:
 
 clean:
 	rm -rf $(BUILDDIR)/*
-    
+
 init: ../lib/imapoptions ../perl/imap/IMAP/Shell.pm
 	@echo "creating imap/reference/manpages/systemcommands/cyradm.rst"
 	$(PERL2RST) cyradm < ../perl/imap/IMAP/Shell.pm > $(SOURCEDIR)/imap/reference/manpages/systemcommands/cyradm.rst

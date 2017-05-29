@@ -206,7 +206,7 @@ To unexpunge a single message:
 .. parsed-literal::
 
     # :command:`/usr/lib/cyrus-imapd/unexpunge -udv user/john@example.org 11422`
-    restoring expunged messages in mailbox 'user/john@example.org'
+    restoring expunged messages in mailbox user/john@example.org
     Unexpunged user/john@example.org: 11422 => 11438
     restored 1 expunged messages
 
