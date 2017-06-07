@@ -101,6 +101,7 @@ MAINTAINERCLEANFILES = \
 	doc/legacy/netnews.png \
 	man/imapd.conf.5 \
 	man/sieveshell.1 \
+	man/imapclone.1 \
 	imap/lmtpstats.h \
 	imap/pushstats.h \
 	sieve/addr.h \
@@ -1491,6 +1492,7 @@ imap_cvt_xlist_specialuse_LDADD = $(LD_UTILITY_ADD)
 
 dist_man1_MANS = \
 	man/imtest.1 \
+	man/imapclone.1 \
 	man/installsieve.1 \
 	man/httptest.1 \
 	man/lmtptest.1 \
@@ -1772,6 +1774,10 @@ docsrc/imap/reference/manpages/configs/imapd.conf.rst: $(top_srcdir)/tools/confi
 	@$(MKDIR_P) $(@D)
 	$(AM_V_GEN)$(top_srcdir)/tools/config2rst $(top_srcdir)/lib/imapoptions > $@
 
+docsrc/imap/reference/manpages/usercommands/imapclone.rst: $(top_srcdir)/perl/imap/Cyrus/ImapClone.pm
+	@$(MKDIR_P) $(@D)
+	$(AM_V_GEN)$(top_srcdir)/tools/perl2rst imapclone < $< > $@
+
 doc/examples/imapd_conf/imapd.conf.sample: $(top_srcdir)/tools/config2sample $(top_srcdir)/lib/imapoptions
 	@$(MKDIR_P) $(@D)
 	$(AM_V_GEN)$(top_srcdir)/tools/config2sample $(top_srcdir)/lib/imapoptions > $@
@@ -1806,7 +1812,8 @@ clean-sphinx-cache:
 if HAVE_SPHINX_BUILD
 GENERATED_RSTS = docsrc/imap/reference/manpages/configs/imapd.conf.rst \
                  docsrc/imap/reference/manpages/systemcommands/cyradm.rst \
-                 docsrc/imap/reference/manpages/usercommands/sieveshell.rst
+                 docsrc/imap/reference/manpages/usercommands/sieveshell.rst \
+		 docsrc/imap/reference/manpages/usercommands/imapclone.rst
 
 SPHINX_OPTS = -d $(SPHINX_CACHE) -n -q
 
